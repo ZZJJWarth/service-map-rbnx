@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import os
+import socket
 import threading
 import time
 from pathlib import Path
@@ -127,6 +128,11 @@ _sub_lock = threading.Lock()
 # Keep the dedicated node + executor alive for the process lifetime.
 _webui_node = None
 _webui_exec = None
+_webui_thread = None
+_stop_evt = threading.Event()
+_convergence_worker = None
+_convergence_cancel = threading.Event()
+_convergence_lock = threading.Lock()
 
 # ── activity log ──────────────────────────────────────────────────────────────
 # A small in-memory ring of timestamped action records so the operator can see,
@@ -170,10 +176,12 @@ def _track_convergence(sx: float, sy: float, stheta: float, settle_s: float = 4.
     """After seeding a pose, wait settle_s for rtabmap to relocalize, then log
     where the robot actually settled and its offset from the clicked estimate
     (distance in metres + heading delta in degrees)."""
-    def _check():
+    def _check(cancel):
         try:
             with reference_time.operation():
-                reference_time.wait(threading.Event(), settle_s)
+                reference_time.wait(cancel, settle_s)
+                if cancel.is_set():
+                    return
                 cur = _live_pose_xytheta()
                 if cur is None:
                     _log_add("pose", "no live pose — cannot measure convergence")
@@ -185,7 +193,20 @@ def _track_convergence(sx: float, sy: float, stheta: float, settle_s: float = 4.
                                  f"Δ from estimate = {dist:.2f} m / {math.degrees(dth):.0f}°")
         except RuntimeError as exc:
             _log_add("pose", f"convergence check interrupted: {exc}")
-    threading.Thread(target=_check, daemon=True).start()
+    global _convergence_worker, _convergence_cancel
+    with _convergence_lock:
+        if _stop_evt.is_set():
+            return
+        _convergence_cancel.set()
+        if _convergence_worker is not None:
+            _convergence_worker.join(timeout=2)
+            if _convergence_worker.is_alive():
+                raise RuntimeError("mapping convergence worker did not stop")
+        _convergence_cancel = threading.Event()
+        cancel = _convergence_cancel
+        _convergence_worker = threading.Thread(target=lambda: _check(cancel), daemon=True)
+        _convergence_worker.start()
+
 
 
 def _ensure_subscriptions() -> None:
@@ -201,9 +222,9 @@ def _ensure_subscriptions() -> None:
     subscriptions are created BEFORE this node's executor starts spinning, so
     they are always serviced.
     """
-    global _subscribed, _webui_node, _webui_exec
+    global _subscribed, _webui_node, _webui_exec, _webui_thread
     with _sub_lock:
-        if _subscribed:
+        if _subscribed or _stop_evt.is_set():
             return
         try:
             import rclpy
@@ -246,8 +267,9 @@ def _ensure_subscriptions() -> None:
             _subscribe_range_sensors(node)
             ex = SingleThreadedExecutor()
             ex.add_node(node)
-            threading.Thread(target=ex.spin, daemon=True).start()
             _webui_node, _webui_exec = node, ex
+            _webui_thread = threading.Thread(target=ex.spin, daemon=True)
+            _webui_thread.start()
             _subscribed = True
             log.info("webui subscribed (dedicated node): map=%s pose=%s", MAP_TOPIC, POSE_TOPIC)
         except Exception as e:  # noqa: BLE001
@@ -965,7 +987,38 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 
+class _MapHTTPServer(ThreadingHTTPServer):
+    daemon_threads = False
+
+    def __init__(self, *args):
+        self._clients = set()
+        self._clients_lock = threading.Lock()
+        super().__init__(*args)
+
+    def get_request(self):
+        connection, address = super().get_request()
+        connection.settimeout(5)
+        with self._clients_lock:
+            self._clients.add(connection)
+        return connection, address
+
+    def close_request(self, request):
+        with self._clients_lock:
+            self._clients.discard(request)
+        super().close_request(request)
+
+    def server_close(self):
+        with self._clients_lock:
+            for connection in self._clients:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass  # The peer or its handler may have already closed it.
+        super().server_close()
+
+
 _server = None
+_server_thread = None
 
 
 _supervisor = None
@@ -983,10 +1036,10 @@ def start_supervisor() -> None:
     global _supervisor
     if _supervisor is not None:
         return
+    _stop_evt.clear()
 
     def _loop() -> None:
-        while True:
-            time.sleep(TRUST_PERIOD_S)
+        while not _stop_evt.wait(TRUST_PERIOD_S):
             try:
                 _ensure_subscriptions()
                 _localization_trust()
@@ -1000,7 +1053,7 @@ def start_supervisor() -> None:
 
 def maybe_start() -> None:
     """Start the web UI iff MAPPING_WEBUI_PORT is set. Idempotent; non-fatal."""
-    global _server
+    global _server, _server_thread
     port = os.environ.get("MAPPING_WEBUI_PORT", "").strip()
     if not port or _server is not None:
         return
@@ -1009,10 +1062,39 @@ def maybe_start() -> None:
     # network may opt into another host explicitly through `webui_host`.
     host = os.environ.get("MAPPING_WEBUI_HOST", "127.0.0.1").strip() or "127.0.0.1"
     try:
-        srv = ThreadingHTTPServer((host, int(port)), _Handler)
+        srv = _MapHTTPServer((host, int(port)), _Handler)
     except Exception as e:  # noqa: BLE001
         log.warning("webui: cannot bind %s:%s: %s", host, port, e)
         return
     _server = srv
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    _server_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    _server_thread.start()
     log.info("map web UI on http://%s:%s", host, port)
+
+
+def stop():
+    global _server, _server_thread, _supervisor, _subscribed
+    global _webui_node, _webui_exec, _webui_thread, _convergence_worker
+    _stop_evt.set()
+    _convergence_cancel.set()
+    if _server is not None:
+        _server.shutdown()
+        _server.server_close()
+        _server = None
+    for worker in (_server_thread, _supervisor, _convergence_worker):
+        if worker is not None:
+            worker.join(timeout=3)
+            if worker.is_alive():
+                raise RuntimeError(f"mapping worker {worker.name} did not stop")
+    _server_thread = _supervisor = _convergence_worker = None
+    with _sub_lock:
+        if _webui_exec is not None:
+            _webui_exec.shutdown(timeout_sec=2)
+        if _webui_thread is not None:
+            _webui_thread.join(timeout=3)
+            if _webui_thread.is_alive():
+                raise RuntimeError("mapping web UI ROS worker did not stop")
+        if _webui_node is not None:
+            _webui_node.destroy_node()
+        _webui_node = _webui_exec = _webui_thread = None
+        _subscribed = False

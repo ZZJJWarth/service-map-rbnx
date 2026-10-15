@@ -442,3 +442,7 @@ mapping_rbnx/
   restart instead of a runtime switch.
 
 License: MulanPSL-2.0
+
+Shutdown cancels reference waits, joins operation, localization, convergence and
+ROS workers, cancels lifecycle retries, and closes the map HTTP listener and its
+accepted sockets. HTTP reads also keep a five-real-second inactivity timeout.

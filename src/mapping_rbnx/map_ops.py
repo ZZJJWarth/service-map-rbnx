@@ -133,6 +133,8 @@ def _get_node():
     (e.g. ROS not sourced) — callers degrade to a clear error."""
     global _node
     with _node_lock:
+        if reference_time._stopping.is_set():
+            return None
         if _node is not None:
             return _node
         try:
@@ -156,6 +158,20 @@ def _get_node():
         except Exception as e:  # noqa: BLE001
             log.warning("map_ops: rclpy node unavailable: %s", e)
             return None
+
+
+def _close_runtime():
+    global _node
+    with _node_lock:
+        node, _node = _node, None
+        if node is None:
+            return
+        executor = node._robonix_executor
+        executor.shutdown(timeout_sec=2)
+        node._robonix_spin.join(timeout=3)
+        if node._robonix_spin.is_alive():
+            raise RuntimeError("mapping ROS worker did not stop")
+        node.destroy_node()
 
 
 def _yaw_to_quat(theta: float):

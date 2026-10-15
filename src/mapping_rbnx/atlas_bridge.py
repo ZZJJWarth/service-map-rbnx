@@ -844,12 +844,31 @@ def shutdown():
     itself is already persistent (rtabmap writes it live at database_path);
     this only adds the portable artifacts. Never fail shutdown on a save
     error — the db is the source of truth."""
-    reference_time.close()
+    errors = []
+    try:
+        reference_time.close()
+    except Exception as error:
+        errors.append(str(error))
     for worker in (_INIT_THREAD, _STARTUP_LOAD_THREAD, map_ops._RELOC_THREAD):
         if worker is not None:
             worker.join(timeout=8.0)
             if worker.is_alive():
-                log.error("mapping worker %s did not stop", worker.name)
+                errors.append(f"mapping worker {worker.name} did not stop")
+    from . import webui
+    for close in (lifecycle._stop, webui.stop, map_ops._close_runtime):
+        try:
+            close()
+        except Exception as error:
+            errors.append(str(error))
+    ros = sys.modules.get("rclpy")
+    if ros is not None:
+        try:
+            if ros.ok():
+                ros.shutdown()
+        except Exception as error:
+            errors.append(str(error))
+    if errors:
+        return Err("; ".join(errors))
     map_dir = _ACTIVE.get("map_dir")
     live = lifecycle.current()
     map_id, mode = live.get("map_id"), live.get("mode")

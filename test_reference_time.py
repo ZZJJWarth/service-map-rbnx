@@ -264,5 +264,26 @@ class ReferenceWaitTests(unittest.TestCase):
         self.assertEqual(clock.reading(), (0, 1, 1))
 
 
+
+class RuntimeCleanupTest(unittest.TestCase):
+    def test_map_ros_executor_is_stopped_joined_and_destroyed(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        from mapping_rbnx import map_ops
+        stop = threading.Event()
+        thread = threading.Thread(target=stop.wait)
+        thread.start()
+        node = SimpleNamespace(_robonix_executor=Mock(shutdown=lambda **_: stop.set()),
+                               _robonix_spin=thread, destroy_node=Mock())
+        try:
+            with patch.object(map_ops, "_node", node):
+                map_ops._close_runtime()
+                self.assertIsNone(map_ops._node)
+                self.assertFalse(thread.is_alive())
+                node.destroy_node.assert_called_once()
+        finally:
+            stop.set()
+            thread.join(1)
+
 if __name__ == "__main__":
     unittest.main()

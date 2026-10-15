@@ -22,6 +22,57 @@ from unittest.mock import patch
 from mapping_rbnx import webui
 
 
+class WebUiShutdownTest(unittest.TestCase):
+    def test_shutdown_joins_frozen_diagnostic_and_bounds_incomplete_http(self):
+        import socket
+        import time
+        with patch.dict(webui.os.environ, {"MAPPING_WEBUI_PORT": "0"}), \
+                patch.object(webui, "_ensure_subscriptions"), \
+                patch.object(webui.reference_time, "reading", return_value=(0, 1, 1)):
+            webui.start_supervisor()
+            webui.maybe_start()
+            port = webui._server.server_address[1]
+            serving, supervising = webui._server_thread, webui._supervisor
+            peers = [socket.create_connection(("127.0.0.1", port), timeout=2) for _ in range(2)]
+            sending = threading.Event()
+
+            def trickle():
+                while not sending.wait(.1):
+                    try:
+                        peers[1].sendall(b"x")
+                    except OSError:
+                        return
+
+            sender = threading.Thread(target=trickle)
+            try:
+                for peer in peers:
+                    peer.sendall(b"GET / HTTP/1.1\r\nX-Test: ")
+                sender.start()
+                deadline = time.monotonic() + 2
+                while getattr(webui._server._threads, "__len__", lambda: 0)() < 2 and time.monotonic() < deadline:
+                    time.sleep(.01)
+                handlers = list(webui._server._threads)
+                self.assertEqual(len(handlers), 2)
+                webui._track_convergence(0, 0, 0, settle_s=.01)
+                diagnostic = webui._convergence_worker
+                self.assertTrue(diagnostic.is_alive())
+                start = time.monotonic()
+                webui.stop()
+                self.assertLess(time.monotonic() - start, 3)
+                self.assertFalse(any(t.is_alive() for t in (serving, supervising, diagnostic, *handlers)))
+                with socket.socket() as probe:
+                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    probe.bind(("127.0.0.1", port))
+            finally:
+                sending.set()
+                if sender.ident is not None:
+                    sender.join(1)
+                for peer in peers:
+                    peer.close()
+                webui.stop()
+                webui._stop_evt.clear()
+
+
 class WebUiApiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
