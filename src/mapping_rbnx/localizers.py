@@ -26,6 +26,8 @@ import shlex
 import signal
 import subprocess
 import time
+
+from mapping_rbnx import engines, reference_time
 from typing import Optional
 
 log = logging.getLogger("mapping.localizers")
@@ -166,13 +168,17 @@ def wait_ready(node, timeout_s: float = 30.0) -> tuple[bool, str]:
     except Exception as e:  # noqa: BLE001
         return False, f"std_srvs unavailable: {e}"
     client = node.create_client(Empty, "/reinitialize_global_localization")
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if client.wait_for_service(timeout_sec=1.0):
-            return True, "localizer ready"
-        if _PROC is not None and _PROC.poll() is not None:
-            return False, f"localizer exited with code {_PROC.returncode} before becoming ready"
-    return False, f"localizer did not expose /reinitialize_global_localization within {timeout_s:.0f}s"
+    try:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            reference_time.reading()
+            if client.wait_for_service(timeout_sec=1.0):
+                return True, "localizer ready"
+            if _PROC is not None and _PROC.poll() is not None:
+                return False, f"localizer exited with code {_PROC.returncode} before becoming ready"
+        return False, f"localizer did not expose /reinitialize_global_localization within {timeout_s:.0f}s"
+    finally:
+        node.destroy_client(client)
 
 
 def global_localize(node, timeout_s: float = 15.0) -> tuple[bool, str]:
@@ -186,15 +192,10 @@ def global_localize(node, timeout_s: float = 15.0) -> tuple[bool, str]:
         from std_srvs.srv import Empty
     except Exception as e:  # noqa: BLE001
         return False, f"std_srvs unavailable: {e}"
-    client = node.create_client(Empty, "/reinitialize_global_localization")
-    if not client.wait_for_service(timeout_sec=min(timeout_s, 10.0)):
-        return False, "/reinitialize_global_localization unavailable (localizer not running?)"
-    future = client.call_async(Empty.Request())
-    deadline = time.monotonic() + timeout_s
-    while not future.done() and time.monotonic() < deadline:
-        time.sleep(0.05)
-    if not future.done():
-        return False, f"global localization request timed out after {timeout_s:.0f}s"
+    ok, detail = engines._call_service(
+        node, Empty, "/reinitialize_global_localization", Empty.Request(), timeout_s)
+    if not ok:
+        return False, str(detail)
     return True, "global localization requested (particles scattered over the map)"
 
 
@@ -490,7 +491,7 @@ def scan_fit(node, grid, pose, timeout_s: float = 6.0) -> tuple[float, str]:
     topic = _CONFIG.get("scan_topic") or "/scan"
     sub = node.create_subscription(LaserScan, topic, _on_scan, 5)
     try:
-        got.wait(timeout_s)
+        reference_time.wait(got, timeout_s)
     finally:
         try:
             node.destroy_subscription(sub)
@@ -549,7 +550,7 @@ def relocalize_statically(node, grid, timeout_s: float = 8.0):
     from rclpy.qos import qos_profile_sensor_data
     sub = node.create_subscription(LaserScan, topic, _on_scan, qos_profile_sensor_data)
     try:
-        got.wait(timeout_s)
+        reference_time.wait(got, timeout_s)
     finally:
         try:
             node.destroy_subscription(sub)
@@ -595,7 +596,7 @@ def current_pose(node, timeout_s: float = 5.0):
 
     sub = node.create_subscription(PoseWithCovarianceStamped, POSE_TOPIC, _on_pose, 10)
     try:
-        got.wait(timeout_s)
+        reference_time.wait(got, timeout_s)
     finally:
         try:
             node.destroy_subscription(sub)
@@ -643,6 +644,7 @@ def wait_for_convergence(node, timeout_s: float = 60.0,
     latest: dict = {"msg": None}
     travel: dict = {"m": 0.0, "last": None}
     rejected = 0
+    checked = None
 
     def _on_pose(msg) -> None:
         latest["msg"] = msg
@@ -658,11 +660,12 @@ def wait_for_convergence(node, timeout_s: float = 60.0,
     sub = node.create_subscription(PoseWithCovarianceStamped, POSE_TOPIC, _on_pose, 10)
     odom_sub = node.create_subscription(Odometry, odom_topic, _on_odom, 20)
     try:
-        deadline = time.monotonic() + timeout_s
+        deadline = reference_time.Deadline(timeout_s)
         best = ""
-        while time.monotonic() < deadline:
+        while not deadline.expired():
             msg = latest["msg"]
-            if msg is not None:
+            if msg is not None and msg is not checked:
+                checked = msg
                 position_sd, yaw_sd = spread(msg)
                 moved = travel["m"]
                 best = (f"position ±{position_sd:.2f} m, heading ±{math.degrees(yaw_sd):.0f}°, "

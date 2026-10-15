@@ -14,6 +14,7 @@ import json
 import re
 import threading
 import unittest
+from types import SimpleNamespace
 import urllib.request
 from http.server import ThreadingHTTPServer
 from unittest.mock import patch
@@ -190,3 +191,61 @@ class RangeEndpointTest(unittest.TestCase):
         webui.set_sensor_topics()
         out = self.get()
         self.assertEqual(out, {"bound": {}})
+
+
+class ReferenceTrustTest(unittest.TestCase):
+    def setUp(self):
+        from mapping_rbnx import reference_time, webui
+        self.webui = webui
+        self.sample = [(0, 1, 1)]
+        self.patches = [
+            patch.object(reference_time, "_clock", SimpleNamespace(read=lambda: self.sample[0])),
+            patch.object(webui, "_reference", None),
+            patch.object(webui, "_latest", dict.fromkeys(webui._latest)),
+            patch.object(webui, "_trust", dict(grid_for="m", grid=object(), fit=None,
+                         at=None, detail="", history=[], bad_since=None,
+                         withdrawn=False, evidence=None)),
+            patch.object(webui.lifecycle, "current", return_value={"mode": "localization", "map_id": "m"}),
+            patch.object(webui, "_live_pose_xytheta", return_value=(0., 0., 0.)),
+            patch.object(webui.localizers, "scan_fit_of", return_value=(.9, "fits")),
+        ]
+        for item in self.patches:
+            item.start()
+            self.addCleanup(item.stop)
+        webui._receive("pose", object())
+        webui._receive("scan", {"pts": [], "frame": "laser"})
+        webui._latest["scan_msg"] = object()
+
+    def test_zero_receipts_stay_fresh_during_pause_without_recounting(self):
+        import time
+        first = self.webui._localization_trust()
+        time.sleep(.03)
+        second = self.webui._localization_trust()
+        self.assertEqual(first["verdict"], "ok")
+        self.assertEqual(second["samples"], 1)
+        self.assertEqual(self.webui._stale_inputs(0.), "")
+        self.sample[0] = (2_000_000_000, 1, 1)
+        self.assertEqual(self.webui._localization_trust()["samples"], 1)
+
+    def test_generation_reset_discards_pose_scan_and_trust_history(self):
+        self.webui._localization_trust()
+        self.sample[0] = (0, 2, 1)
+        self.webui._reference_now()
+        self.assertIsNone(self.webui._latest["pose"])
+        self.assertIsNone(self.webui._latest["scan_msg"])
+        self.assertEqual(self.webui._trust["history"], [])
+
+    def test_bad_since_zero_does_not_trigger_recovery_while_paused(self):
+        with patch.object(self.webui.map_ops, "relocalize_impl") as recover:
+            self.webui._enforce_trust(False, "m", .1)
+            self.webui._enforce_trust(False, "m", .1)
+            self.assertEqual(self.webui._trust["bad_since"], 0.)
+            recover.assert_not_called()
+
+
+    def test_projection_from_previous_generation_is_discarded(self):
+        baseline = self.sample[0]
+        self.sample[0] = (0, 2, 1)
+        self.assertFalse(self.webui._receive("scan", {"pts": [(1., 0.)]}, baseline))
+        self.assertIsNone(self.webui._latest["scan"])
+        self.assertIsNone(self.webui._latest["scan_msg"])

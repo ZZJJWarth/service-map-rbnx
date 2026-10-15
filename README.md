@@ -15,6 +15,25 @@ SLAM engine.
 - Provider instance configuration reference: **[config.spec](config.spec)**.
 - Offline global-localization benchmark, dataset setup, and results: **[BENCHMARK.md](BENCHMARK.md)**.
 
+## Reference time
+
+Managed deployments pass `reference` with the Chronos `kind` and `provider_id`.
+`ros_time` follows the Chronos stream through Atlas without extrapolating
+pauses. Standalone configurations with `use_sim_time: true` select `ros_time`
+from provider `chronos` when `reference` is absent. Rebuild bindings and use
+the current `robonix-api` before enabling this path.
+
+INIT returns `Deferred` while waiting for the first reference reading and
+background initialization. Grid,
+scan and pose waits and localization convergence use reference time. Zero is
+valid. Reference loss, reconnection or a generation change aborts the current
+wait; gRPC cancellation and shutdown stop pending waits. Individual ROS service
+calls, scan-matching computation, disk operations and process shutdown keep
+real deadlines. Preview collection and settling follow reference time; its
+parent checks collection progress and bounds writing in real time. MCP map
+save/load and pose reads run off the event loop and propagate cancellation.
+Localization trust uses reference age and counts each scan delivery once.
+
 ## SLAM engines (`algo`)
 
 | algo | use | inputs |
