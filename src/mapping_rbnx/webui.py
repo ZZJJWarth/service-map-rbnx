@@ -660,6 +660,11 @@ def _localization_trust() -> dict:
     if _trust["grid_for"] != map_id:
         _trust.update(grid_for=map_id, grid=localizers.load_grid(map_dir),
                       fit=None, at=None, detail="", history=[], evidence=None)
+    run_id = (map_ops._LOCALIZATION.snapshot()["run_id"]
+              if map_ops.active_algo() == "slam_toolbox" else None)
+    if _trust.get("run_id") != run_id:
+        _trust.update(run_id=run_id, fit=None, at=None, detail="", history=[],
+                      evidence=None, bad_since=None, withdrawn=False)
     if _trust["at"] is None or now - _trust["at"] >= TRUST_PERIOD_S:
         # Comparing a stale scan against a stale pose measures nothing: the two
         # were captured together and agree with each other for as long as both
@@ -720,6 +725,14 @@ def _enforce_trust(good: bool, map_id: str, fit: float) -> None:
     disagreement is a robot that has been moved or has slipped, and driving on
     is the dangerous option.
     """
+    if map_ops.active_algo() != "slam_toolbox":
+        return
+    session = map_ops._LOCALIZATION.snapshot()
+    if session["map_id"] == map_id and session["state"] == "running":
+        # Initial localization already withdrew the engine. Never restart its
+        # search just because it has not produced a verified pose yet.
+        _trust["bad_since"] = None
+        return
     now = _reference_now()
     if good:
         _trust["bad_since"] = None
@@ -749,36 +762,18 @@ def _localization_state() -> dict:
     once it is tight enough to act on. The spread is reported too, so the page
     can show it shrinking rather than just flipping between two words.
     """
-    if not localizers.enabled():
+    if map_ops.active_algo() != "slam_toolbox" or not localizers.enabled():
         return {"state": "off"}
     # Configured is not running: in mapping mode the SLAM engine owns the pose
     # and the particle filter is not up, so there is nothing to wait for.
     if map_ops.get_mode_impl().get("mode", "") != "localization":
         return {"state": "off"}
-    reloc = localizers.relocalization()
-    msg = _latest.get("localizer_pose")
-    if msg is None:
-        # No filter estimate is the normal case now: a scan matched against the
-        # map standing still never starts one. The recorded outcome is then the
-        # only thing that knows how the relocalization went.
-        state = {"done": "converged", "running": "converging",
-                 "failed": "failed"}.get(reloc.get("state"), "waiting")
-        return {"state": state, "localizer": localizers.name(),
-                "detail": reloc.get("detail", "")}
-    position_stddev, yaw_stddev = localizers.spread(msg)
-    state = localizers.convergence_state(position_stddev, yaw_stddev)
-    if reloc.get("state") == "failed":
-        # The filter's own numbers are stale once it has been stopped; the
-        # recorded outcome is what actually happened.
-        state = "failed"
-    return {
-        "state": state,
-        "detail": reloc.get("detail", ""),
-        "localizer": localizers.name(),
-        "position_stddev_m": round(position_stddev, 3),
-        "yaw_stddev_rad": round(yaw_stddev, 3),
-        "age_s": round(_reference_now() - float(_latest.get("localizer_pose_at") or 0.0), 1),
-    }
+    session = map_ops._LOCALIZATION.snapshot()
+    live = lifecycle.current()
+    if session["map_id"] != live.get("map_id") or session["generation"] != live.get("generation"):
+        return {"state": "waiting", "phase": "idle", "localizer": localizers.name(), "candidates": []}
+    state = {"done": "converged", "running": "converging", "failed": "failed"}.get(session["state"], "waiting")
+    return {**session, "state": state, "localizer": localizers.name()}
 
 
 def _list_saved_maps() -> list[dict]:
@@ -885,7 +880,8 @@ class _Handler(BaseHTTPRequestHandler):
                       "localizer": localizers.name(),
                       "localization": _localization_state(),
                       "trust": _localization_trust(),
-                      "map_id": live.get("map_id", "")}
+                      "map_id": live.get("map_id", ""),
+                      "generation": live.get("generation", 0)}
                 if g is not None:
                     st.update(width=g.info.width, height=g.info.height,
                               resolution=round(g.info.resolution, 4),
@@ -899,6 +895,8 @@ class _Handler(BaseHTTPRequestHandler):
                         st["dist_from_seed"] = round(math.hypot(cur[0] - _seed["x"],
                                                                 cur[1] - _seed["y"]), 3)
                 return self._json(st)
+            if p == "/api/pose_candidates":
+                return self._json(map_ops.get_pose_candidates_impl())
             if p == "/api/range":
                 # One request for every bound overlay: the page draws them
                 # together and a second round trip would let them drift apart
@@ -961,7 +959,13 @@ class _Handler(BaseHTTPRequestHandler):
             if p == "/api/pose_estimate":
                 x, y, th = (float(body.get("x", 0.0)), float(body.get("y", 0.0)),
                             float(body.get("theta", 0.0)))
-                out = map_ops.pose_estimate_impl(x, y, th)
+                if map_ops.active_algo() == "slam_toolbox" and "run_id" in body:
+                    live = lifecycle.current()
+                    if body.get("map_id") != live.get("map_id") or body.get("generation") != live.get("generation"):
+                        return self._json({"ok": False, "detail": "map changed; refresh before choosing a pose"})
+                    out = map_ops.pose_estimate_impl(x, y, th, run_id=int(body["run_id"]))
+                else:
+                    out = map_ops.pose_estimate_impl(x, y, th)
                 if out.get("ok"):
                     _seed.update(x=x, y=y, theta=th, t=time.time())
                     _log_add("pose", f"estimate seeded → ({x:.2f}, {y:.2f}, {math.degrees(th):.0f}°); "

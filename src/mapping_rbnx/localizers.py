@@ -1,21 +1,10 @@
 # SPDX-License-Identifier: MulanPSL-2.0
-"""Localization on a saved map, with automatic global relocalization.
+"""ROS adapters for scan matching and the AMCL/Beluga fallback.
 
-The SLAM engines can localize in their own map, but only from a pose someone
-supplies: RTAB-Map's localization needs a seed close enough for scan matching to
-converge, which is the "click 2D Pose Estimate, then click again" loop. A
-particle filter over the saved occupancy grid does not: its
-`reinitialize_global_localization` service spreads particles across the free
-space and the robot converges by driving. That is what this module runs.
-
-`load_map` calls `activate()` with the saved map directory. With an initial pose
-it seeds `/initialpose`; without one it asks for global localization. Both paths
-end with the localizer owning the `map → odom` transform, so the service's
-`pose` / `odom` contracts keep publishing exactly as before (`tf_to_pose.py`
-reads the same tf chain).
-
-Cost: nav2_amcl with 500-2000 particles is a few tens of MB of RAM and a few
-percent of one core — no GPU, no database.
+LocalizationFlow owns the application state. This module starts/stops the
+particle filter, receives scans and poses, measures convergence, and provides
+static matching and laser verification. The fallback runs without publishing
+map -> odom; only the verified map engine takes over that transform.
 """
 from __future__ import annotations
 
@@ -207,23 +196,6 @@ def global_localize(node, timeout_s: float = 15.0) -> tuple[bool, str]:
 # guess. Thresholds are the point where the estimate is good enough to plan
 # with; they are deliberately loose, because the alternative to a converging
 # filter is no localization at all.
-# Relocalization runs behind an already-loaded map, so its outcome is not the
-# return value of anything the operator called; it is recorded here for the
-# status page to report.
-_RELOC: dict = {"state": "idle", "detail": ""}
-
-
-def set_relocalization(state: str, detail: str = "") -> None:
-    """Record how the running (or last) relocalization is doing."""
-    _RELOC["state"] = state
-    _RELOC["detail"] = detail
-
-
-def relocalization() -> dict:
-    """The recorded relocalization outcome: idle / running / done / failed."""
-    return dict(_RELOC)
-
-
 POSE_TOPIC = os.environ.get("MAPPING_LOCALIZER_POSE_TOPIC", "/amcl_pose")
 CONVERGED_POSITION_M = 0.25
 CONVERGED_YAW_RAD = 0.15
@@ -471,36 +443,69 @@ def sensor_offset_xy(node=None, laser_frame: str = "", base_frame: str = "") -> 
     return (0.0, 0.0)
 
 
+class _Receiver:
+    """Own subscriptions before starting their executor.
+
+    Temporary subscriptions attached to the shared, already-spinning map-ops
+    node intermittently receive nothing with the native Zenoh transport.
+    An isolated receiver also keeps concurrent candidate/service waits from
+    changing the same executor's entity set.
+    """
+    def __init__(self, source_node, subscriptions):
+        import threading
+        from rclpy.node import Node
+        from rclpy.executors import SingleThreadedExecutor
+        self.node = Node(f"mapping_receiver_{time.monotonic_ns()}",
+                         context=source_node.context)
+        self.executor = SingleThreadedExecutor(context=source_node.context)
+        try:
+            for msg_type, topic, callback, qos in subscriptions:
+                self.node.create_subscription(msg_type, topic, callback, qos)
+            self.executor.add_node(self.node)
+            self.thread = threading.Thread(target=self.executor.spin, daemon=True)
+            self.thread.start()
+        except Exception:
+            self.node.destroy_node()
+            raise
+
+    def close(self):
+        # Never destroy entities while the executor can still dispatch them.
+        self.executor.shutdown()
+        self.thread.join()
+        self.node.destroy_node()
+
+
+def _next_scan(node, timeout_s):
+    import threading
+    from sensor_msgs.msg import LaserScan
+    from rclpy.qos import qos_profile_sensor_data
+    got = threading.Event()
+    latest = {"msg": None}
+    def on_scan(msg):
+        latest["msg"] = msg
+        got.set()
+    topic = _CONFIG.get("scan_topic") or "/scan"
+    receiver = _Receiver(node, [(LaserScan, topic, on_scan, qos_profile_sensor_data)])
+    try:
+        reference_time.wait(got, timeout_s)
+    finally:
+        receiver.close()
+    return latest["msg"]
+
+
 def scan_fit(node, grid, pose, timeout_s: float = 6.0) -> tuple[float, str]:
     """`scan_fit_of` on the next scan to arrive on the configured topic."""
     if grid is None:
         return -1.0, "no saved grid to check against"
-    try:
-        from sensor_msgs.msg import LaserScan
-    except Exception as e:  # noqa: BLE001
-        return -1.0, f"sensor_msgs unavailable: {e}"
-    import threading
-
-    got = threading.Event()
-    latest: dict = {"msg": None}
-
-    def _on_scan(msg) -> None:
-        latest["msg"] = msg
-        got.set()
-
     topic = _CONFIG.get("scan_topic") or "/scan"
-    sub = node.create_subscription(LaserScan, topic, _on_scan, 5)
     try:
-        reference_time.wait(got, timeout_s)
-    finally:
-        try:
-            node.destroy_subscription(sub)
-        except Exception:  # noqa: BLE001
-            pass
-    if latest["msg"] is None:
+        msg = _next_scan(node, timeout_s)
+    except Exception as e:
+        return -1.0, f"scan receiver unavailable: {e}"
+    if msg is None:
         return -1.0, f"no scan on {topic} within {timeout_s:.0f}s"
-    return scan_fit_of(grid, latest["msg"], pose,
-                       sensor_offset_xy(node, latest["msg"].header.frame_id))
+    return scan_fit_of(grid, msg, pose,
+                       sensor_offset_xy(node, msg.header.frame_id))
 
 
 
@@ -520,57 +525,35 @@ def _global_match_module():
     return global_match
 
 
-def relocalize_statically(node, grid, timeout_s: float = 8.0):
-    """Find the robot on `grid` from one scan, without moving it.
+def match_statically(node, grid, timeout_s: float = 8.0):
+    """Return the raw Top-K scan match, including ambiguous or low-score fits.
 
-    Returns (pose, detail) with pose None when the scan does not single a place
-    out. Standing still is the normal case on a robot that has just been
-    switched on or carried somewhere, and a particle filter cannot serve it:
-    its update is driven by motion, so with the robot still the cloud never
-    sharpens. Matching the scan against the map has no such requirement.
+    Both automatic relocalization and the public candidate query use this
+    scan/topic/laser-offset path, so their confidence decisions refer to the
+    same robot pose rather than to different sensor frames.
     """
+    if grid is None:
+        return None, "saved occupancy grid unavailable"
     try:
         matcher = _global_match_module()
     except Exception as e:  # noqa: BLE001
         return None, f"static matching unavailable: {e}"
-    try:
-        from sensor_msgs.msg import LaserScan
-    except Exception as e:  # noqa: BLE001
-        return None, f"sensor_msgs unavailable: {e}"
-    import threading
-
-    got = threading.Event()
-    latest: dict = {"msg": None}
-
-    def _on_scan(msg) -> None:
-        latest["msg"] = msg
-        got.set()
-
     topic = _CONFIG.get("scan_topic") or "/scan"
-    from rclpy.qos import qos_profile_sensor_data
-    sub = node.create_subscription(LaserScan, topic, _on_scan, qos_profile_sensor_data)
     try:
-        reference_time.wait(got, timeout_s)
-    finally:
-        try:
-            node.destroy_subscription(sub)
-        except Exception:  # noqa: BLE001
-            pass
-    if latest["msg"] is None:
+        msg = _next_scan(node, timeout_s)
+    except Exception as e:
+        return None, f"scan receiver unavailable: {e}"
+    if msg is None:
         return None, f"no scan on {topic} within {timeout_s:.0f}s"
-
-    match = matcher.global_scan_match(grid, latest["msg"],
-                                      sensor_xy=sensor_offset_xy(
-                                          node, latest["msg"].header.frame_id))
+    try:
+        match = matcher.global_scan_match(
+            grid, msg, sensor_xy=sensor_offset_xy(node, msg.header.frame_id))
+    except Exception as e:  # noqa: BLE001
+        log.exception("[localizer] static scan matching failed")
+        return None, f"static matching failed: {e}"
     if match is None:
         return None, "the scan does not cover enough of the map to place the robot"
-    if match.score < STATIC_MATCH_MIN:
-        return None, (f"no place on the map explains this scan ({match.detail}) — "
-                      f"is the robot on this map at all?")
-    if match.score - match.runner_up < STATIC_MATCH_MARGIN:
-        return None, (f"two places on the map explain this scan equally well "
-                      f"({match.detail}) — move the robot a metre and try again")
-    return match.pose, f"matched the map standing still: {match.detail}"
+    return match, ""
 
 
 def current_pose(node, timeout_s: float = 5.0):
@@ -594,14 +577,11 @@ def current_pose(node, timeout_s: float = 5.0):
         latest["msg"] = msg
         got.set()
 
-    sub = node.create_subscription(PoseWithCovarianceStamped, POSE_TOPIC, _on_pose, 10)
+    receiver = _Receiver(node, [(PoseWithCovarianceStamped, POSE_TOPIC, _on_pose, 10)])
     try:
         reference_time.wait(got, timeout_s)
     finally:
-        try:
-            node.destroy_subscription(sub)
-        except Exception:  # noqa: BLE001
-            pass
+        receiver.close()
     msg = latest["msg"]
     if msg is None:
         return None
@@ -612,7 +592,7 @@ def current_pose(node, timeout_s: float = 5.0):
 
 def wait_for_convergence(node, timeout_s: float = 60.0,
                          min_travel_m: float = MIN_TRAVEL_M,
-                         map_dir: str = "") -> tuple[bool, tuple[float, float, float], str]:
+                         map_dir: str = "", interrupt_event=None) -> tuple[bool, tuple[float, float, float], str]:
     """Watch the filter until it agrees with itself, has moved, and matches the
     map, or give up.
 
@@ -657,12 +637,16 @@ def wait_for_convergence(node, timeout_s: float = 60.0,
         travel["last"] = (p.x, p.y)
 
     odom_topic = os.environ.get("MAPPING_ODOM_TOPIC", _CONFIG.get("odom_topic") or "/odom")
-    sub = node.create_subscription(PoseWithCovarianceStamped, POSE_TOPIC, _on_pose, 10)
-    odom_sub = node.create_subscription(Odometry, odom_topic, _on_odom, 20)
+    receiver = _Receiver(node, [
+        (PoseWithCovarianceStamped, POSE_TOPIC, _on_pose, 10),
+        (Odometry, odom_topic, _on_odom, 20),
+    ])
     try:
         deadline = reference_time.Deadline(timeout_s)
         best = ""
         while not deadline.expired():
+            if interrupt_event is not None and interrupt_event.is_set():
+                return False, (0.0, 0.0, 0.0), "operator supplied an initial pose"
             msg = latest["msg"]
             if msg is not None and msg is not checked:
                 checked = msg
@@ -702,8 +686,4 @@ def wait_for_convergence(node, timeout_s: float = 60.0,
                 f"support and was re-scattered each time; last was {best}")
         return False, (0.0, 0.0, 0.0), f"{name()} did not converge within {timeout_s:.0f}s ({best})"
     finally:
-        for s_ in (sub, odom_sub):
-            try:
-                node.destroy_subscription(s_)
-            except Exception:  # noqa: BLE001
-                pass
+        receiver.close()

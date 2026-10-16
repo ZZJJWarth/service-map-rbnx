@@ -74,28 +74,6 @@ class LoadMapTransactionTest(unittest.TestCase):
         )
         self.assertIn("verified fresh occupancy", result["detail"])
 
-    def test_reference_reset_during_engine_stop_cannot_publish_map_identity(self):
-        sample = [(0, 1, 1)]
-
-        def stop():
-            sample[0] = (0, 2, 1)
-            return True, "stopped"
-
-        ops = SimpleNamespace(graph_ready=lambda _path: (True, "ok"), stop_engine=stop)
-        with (patch.object(map_ops.reference_time, "_clock", SimpleNamespace(read=lambda: sample[0])),
-              patch.object(map_ops, "MAPS_DIR", self.tmp.name),
-              patch.object(map_ops, "active_algo", return_value="slam_toolbox"),
-              patch.object(map_ops, "map_engine", return_value="slam_toolbox"),
-              patch.object(map_ops, "_engine", return_value=ops),
-              patch.object(map_ops, "_get_node", return_value=object()),
-              patch.object(map_ops.localizers, "enabled", return_value=True),
-              patch.object(map_ops.lifecycle, "set_state") as publish,
-              patch.object(map_ops.lifecycle, "mark_reset") as reset):
-            with self.assertRaises(RuntimeError):
-                map_ops.load_map_impl("target")
-        publish.assert_not_called()
-        reset.assert_not_called()
-
     def test_mode_switch_failure_never_loads_database(self):
         with (
             patch.object(map_ops, "MAPS_DIR", self.tmp.name),
@@ -167,6 +145,33 @@ class LoadMapTransactionTest(unittest.TestCase):
         self.assertFalse(map_ops._occupancy_sample_ready(unknown)[0])
         self.assertFalse(map_ops._occupancy_sample_ready(malformed)[0])
         self.assertFalse(map_ops._occupancy_sample_ready(no_resolution)[0])
+
+
+class SlamLoadTransactionTest(unittest.TestCase):
+    setUp = LoadMapTransactionTest.setUp
+
+    def test_reference_reset_during_engine_stop_cannot_publish_map_identity(self):
+        sample = [(0, 1, 1)]
+
+        def stop():
+            sample[0] = (0, 2, 1)
+            return True, "stopped"
+
+        ops = SimpleNamespace(graph_ready=lambda _path: (True, "ok"), stop_engine=stop)
+        with (patch.object(map_ops.reference_time, "_clock", SimpleNamespace(read=lambda: sample[0])),
+              patch.object(map_ops, "MAPS_DIR", self.tmp.name),
+              patch.object(map_ops, "active_algo", return_value="slam_toolbox"),
+              patch.object(map_ops, "map_engine", return_value="slam_toolbox"),
+              patch.object(map_ops, "_engine", return_value=ops),
+              patch.object(map_ops, "_get_node", return_value=object()),
+              patch.object(map_ops.localizers, "enabled", return_value=True),
+              patch.object(map_ops.lifecycle, "set_state") as publish,
+              patch.object(map_ops.lifecycle, "mark_reset") as reset):
+            with self.assertRaises(RuntimeError):
+                map_ops.load_map_impl("target")
+        publish.assert_not_called()
+        reset.assert_not_called()
+
 
 
 if __name__ == "__main__":

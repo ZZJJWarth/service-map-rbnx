@@ -10,7 +10,55 @@ function setStatus(t) {
 // fit() pins the canvas backing-store resolution to its CSS display size,
 // so pointer coords map 1:1 — this is what kept the click coords honest.
 let STALE = true;
+let CANDIDATES = [];
+let CANDIDATE_MAP = null;
+let SUBMITTING_POSE = false;
 let CURTRUST = null;
+let OPENED_CANDIDATE_RUN = null;
+let CANDIDATE_SIGNATURE = "";
+let POLL_SEQUENCE = 0;
+let POLL_APPLIED = 0;
+
+function localizationProgress() {
+  const loc = CURLOC || {};
+  if (STALE) return {key: "offline", title: "Connecting to localization", detail: "Waiting for live status. Updates resume automatically when connected."};
+  const progress = {
+    idle: ["Waiting for initial localization", "Load a saved map in localization mode to begin."],
+    restarting: ["Restarting localization", "Finishing the previous operation before starting a new search. Previous results have been discarded."],
+    searching: ["Searching the map for the initial pose", "Keep the robot still during the initial scan match. A clear match is accepted automatically; otherwise up to five candidates will appear."],
+    choosing: ["Confirm the robot position", "Choose a numbered position and heading, or move the robot manually to help the particle filter converge."],
+    verifying: ["Initial pose found · verifying", "Checking the live laser against the map before activating localization."],
+    starting: ["Activating localization", "Starting the map engine at the verified pose and checking its live output."],
+    ready: ["Localization ready", "The red marker shows the robot position. See laser verification for live confidence."],
+    failed: ["Localization failed", "Review the details and restart localization, or supply an initial pose on the map."],
+  };
+  const phase = loc.phase || "idle";
+  const [title, detail] = progress[phase] || progress.idle;
+  return {key: phase, title: phase === "choosing" && CANDIDATES.length ? title + " · " + CANDIDATES.length + " candidates" : title,
+    detail: phase === "choosing" && loc.filter_state === "stopped" ? loc.detail : detail,
+    busy: ["restarting", "searching", "verifying", "starting"].includes(phase),
+    since: (loc.phase_started_at || loc.started_at || 0) * 1000,
+    action: phase === "choosing" && CANDIDATES.length > 0};
+}
+
+function renderLocalizationProgress() {
+  const panel = document.getElementById("loc-progress");
+  if (!panel) return;
+  panel.hidden = CURENGINE !== "slam_toolbox" || CURMODE !== "localization";
+  if (panel.hidden) return;
+  const p = localizationProgress();
+  panel.dataset.state = p.key;
+  document.getElementById("loc-progress-title").textContent = p.title;
+  document.getElementById("loc-progress-detail").textContent = p.detail;
+  document.getElementById("loc-progress-spinner").hidden = !p.busy;
+  document.getElementById("loc-progress-time").textContent = p.since && ["restarting", "searching", "choosing", "verifying", "starting"].includes(p.key)
+    ? "Elapsed " + Math.max(0, Math.floor((Date.now() - p.since) / 1000)) + " s" : "";
+  document.getElementById("loc-progress-action").hidden = !p.action;
+  const filter = document.getElementById("candidate-filter-status");
+  if (filter) filter.textContent = p.key === "choosing"
+    ? ({starting: "Particle filter is starting. You can already choose a candidate.", running: "Particle filter is active. You can choose a candidate or move the robot manually to help it converge.", stopped: "Particle filter has stopped. Choose an initial pose or restart localization."}[CURLOC.filter_state] || "") : "";
+}
+setInterval(renderLocalizationProgress, 1000);
 
 // The trust line answers "is my localization right?" from the map rather than
 // from the filter's own confidence, which is why it can disagree with the
@@ -38,9 +86,7 @@ function applyTrust() {
       " of the laser lands on mapped walls (needs " + gate + ")";
   } else if (t.verdict == "stale") {
     icon.textContent = "!";
-    text.innerHTML = "<b>Nothing is tracking the robot</b> — " + (t.detail || "") +
-      ". The check cannot run, so the map frame is withdrawn rather than " +
-      "assumed good.";
+    text.textContent = "The pose has not passed live verification. See localization progress below.";
   } else if (t.verdict == "suspect") {
     icon.textContent = "!";
     text.innerHTML = t.withdrawn
@@ -126,7 +172,7 @@ function draw() {
     fitView();
     return;
   }
-  if (!userMoved && MI.pose) center = [MI.pose.x, MI.pose.y];
+  if (!userMoved && MI.pose && (CURENGINE !== "slam_toolbox" || MI.localization?.state === "converged")) center = [MI.pose.x, MI.pose.y];
   // occupancy underlay — map.png is already y-flipped (row0 = world max-y),
   // so place top-left at world (origin_x, origin_y+hMeters) and grow down.
   if (mapImg && MI.resolution > 0) {
@@ -168,6 +214,31 @@ function draw() {
       let p = w2p(q[0], q[1]);
       cx.fillRect(p[0] - 1.5, p[1] - 1.5, 3, 3);
     }
+  }
+  // Alternatives are shown only when the matcher cannot pick one confidently.
+  for (const candidate of CANDIDATES) {
+    const p = w2p(candidate.x, candidate.y);
+    const hue = candidate.rank === 1 ? "#ffb454" : "#9ecaff";
+    cx.save();
+    cx.translate(p[0], p[1]);
+    cx.rotate(-candidate.theta);
+    cx.fillStyle = hue;
+    cx.strokeStyle = "#10151d";
+    cx.lineWidth = 2;
+    cx.beginPath();
+    cx.moveTo(17, 0);
+    cx.lineTo(-10, -8);
+    cx.lineTo(-7, 0);
+    cx.lineTo(-10, 8);
+    cx.closePath();
+    cx.fill();
+    cx.stroke();
+    cx.restore();
+    cx.fillStyle = "#10151d";
+    cx.fillRect(p[0] + 16, p[1] - 11, 46, 17);
+    cx.fillStyle = hue;
+    cx.font = "bold 11px system-ui";
+    cx.fillText("#" + candidate.rank + " " + Math.round(candidate.score * 100) + "%", p[0] + 19, p[1] + 1);
   }
   // pose-estimate arrow being dragged. Long enough to be unambiguous is drawn
   // in amber; too short is drawn in grey with the reason, because releasing
@@ -220,7 +291,7 @@ function draw() {
     );
   }
   // live pose marker
-  if (MI.pose) {
+  if (MI.pose && (CURENGINE !== "slam_toolbox" || MI.localization?.state === "converged")) {
     let p = w2p(MI.pose.x, MI.pose.y),
       yaw = MI.pose.theta;
     cx.fillStyle = "#e63b3b";
@@ -368,7 +439,10 @@ async function finishPose() {
 }
 async function poll() {
   try {
+    const request = ++POLL_SEQUENCE;
     let s = await (await fetch("/api/state")).json();
+    if (request < POLL_APPLIED) return;
+    POLL_APPLIED = request;
     MI = s;
     if (s.mode) CURMODE = s.mode;
     CURENGINE = s.engine || "";
@@ -376,6 +450,9 @@ async function poll() {
     CURLOC = s.localization || null;
     CURTRUST = s.trust || null;
     CURMAP = s.map_id || "";
+    const candidateTool = document.getElementById("tool-candidates");
+    if (candidateTool) candidateTool.hidden = s.engine !== "slam_toolbox";
+    syncCandidates(s);
     applyMode();
     applyTrust();
     setPose(
@@ -404,9 +481,11 @@ async function poll() {
       setStatus("live");
     }
     draw();
+    renderLocalizationProgress();
   } catch (e) {
     STALE = true;
     setStatus("disconnected");
+    renderLocalizationProgress();
   }
 }
 setInterval(poll, 1000);
@@ -436,13 +515,69 @@ setInterval(() => {
 // The map is the page; everything else is a panel raised over it from the
 // toolbar. Opening one refreshes it immediately rather than waiting for the
 // next poll, and closing it stops that poll.
+
+function syncCandidates(state) {
+  const loc = state.localization || {};
+  const sameMap = state.engine === "slam_toolbox" && loc.map_id === state.map_id && loc.generation === state.generation;
+  const poses = sameMap && loc.phase === "choosing" && Array.isArray(loc.candidates) ? loc.candidates : [];
+  const signature = JSON.stringify([loc.run_id, loc.phase, poses]);
+  CANDIDATES = poses;
+  CANDIDATE_MAP = poses.length ? {map_id: state.map_id, generation: state.generation, run_id: loc.run_id} : null;
+  document.getElementById("candidate-status").textContent = loc.detail || "No candidate positions for the current localization run.";
+  if (signature !== CANDIDATE_SIGNATURE) {
+    CANDIDATE_SIGNATURE = signature;
+    const list = document.getElementById("candidate-list");
+    list.replaceChildren();
+    for (const pose of poses) {
+      const item = document.createElement("div");
+      item.className = "candidate-item";
+      const label = document.createElement("span");
+      label.textContent = `#${pose.rank} · ${Math.round(pose.score * 100)}% · (${pose.x.toFixed(2)}, ${pose.y.toFixed(2)}) · ${(pose.theta * 180 / Math.PI).toFixed(0)}°`;
+      const button = document.createElement("button");
+      button.className = "btn sm";
+      button.textContent = "Choose this pose";
+      button.addEventListener("click", () => chooseCandidate(pose));
+      item.append(label, button);
+      list.appendChild(item);
+    }
+  }
+  if (poses.length && OPENED_CANDIDATE_RUN !== loc.run_id) {
+    OPENED_CANDIDATE_RUN = loc.run_id;
+    if (!paneOpen("candidatepanel")) togglePanel("candidatepanel");
+  }
+}
+
+async function chooseCandidate(pose) {
+  if (!CANDIDATE_MAP || SUBMITTING_POSE) return;
+  const expected = {...CANDIDATE_MAP};
+  const confirmed = await askConfirm(
+    "Use pose candidate #" + pose.rank + "?",
+    `Check that the robot is near (${pose.x.toFixed(2)}, ${pose.y.toFixed(2)}) facing ${(pose.theta * 180 / Math.PI).toFixed(0)}°. The live laser will verify this pose.`,
+    {yes: "Use initial pose"},
+  );
+  if (!confirmed) return;
+  SUBMITTING_POSE = true;
+  try {
+    const result = await (await fetch("/api/pose_estimate", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({x: pose.x, y: pose.y, theta: pose.theta, ...expected}),
+    })).json();
+    if (!result.ok) setStatus(result.detail || "Could not submit pose.");
+    await poll();
+  } catch (e) {
+    setStatus("Could not submit pose: " + e.message);
+  } finally {
+    SUBMITTING_POSE = false;
+  }
+}
+
 function togglePanel(id) {
   const dock = document.getElementById("dock");
   const pane = document.getElementById(id);
   const already = pane.classList.contains("on") && dock.classList.contains("on");
   for (const p of document.querySelectorAll(".pane")) p.classList.remove("on");
   for (const t of document.querySelectorAll(".tab")) t.classList.remove("on");
-  for (const b of ["tool-save", "tool-library", "tool-log"]) {
+  for (const b of ["tool-save", "tool-library", "tool-candidates", "tool-log"]) {
     const el = document.getElementById(b);
     if (el) el.classList.remove("active");
   }
@@ -454,7 +589,7 @@ function togglePanel(id) {
   pane.classList.add("on");
   const tab = document.getElementById("tab-" + id);
   if (tab) tab.classList.add("on");
-  const tool = { savepanel: "tool-save", libpanel: "tool-library", logpanel: "tool-log" }[id];
+  const tool = { savepanel: "tool-save", libpanel: "tool-library", candidatepanel: "tool-candidates", logpanel: "tool-log" }[id];
   if (tool) document.getElementById(tool).classList.add("active");
   if (id == "libpanel") loadLib();
   if (id == "logpanel") loadLog();
@@ -465,7 +600,7 @@ function closeDock() {
   document.getElementById("dock").classList.remove("on");
   for (const p of document.querySelectorAll(".pane")) p.classList.remove("on");
   for (const t of document.querySelectorAll(".tab")) t.classList.remove("on");
-  for (const b of ["tool-save", "tool-library", "tool-log"]) {
+  for (const b of ["tool-save", "tool-library", "tool-candidates", "tool-log"]) {
     const el = document.getElementById(b);
     if (el) el.classList.remove("active");
   }
@@ -524,6 +659,7 @@ async function doRelocalize() {
   await runExclusive("Relocalizing", "matching what the laser sees against the map", async () => {
     const r = await (await fetch("/api/relocalize", { method: "POST" })).json();
     setStatus(r.detail || (r.ok ? "relocalizing" : "relocalize failed"));
+    await poll();
   });
 }
 
@@ -758,6 +894,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key == "Escape" && MODALRESOLVE) closeModal(false);
 });
 function applyMode() {
+  document.getElementById("btn-reloc").hidden = CURENGINE !== "slam_toolbox";
   let mp = document.getElementById("btn-mapping"),
     lo = document.getElementById("btn-localization");
   let bdg = document.getElementById("modebadge");
@@ -776,10 +913,10 @@ function applyMode() {
     lb.classList.toggle("loc-converged", st == "converged");
     lb.classList.toggle("loc-failed", st == "failed");
     if (st == "waiting") {
-      lb.textContent = "relocalizing — waiting for the filter";
+      lb.textContent = "Waiting for initial localization";
       lb.title = "The localizer has been asked to relocalize but has not published an estimate yet.";
     } else if (st == "converging") {
-      lb.textContent = "relocalizing… ±" + (CURLOC.position_stddev_m ?? 0).toFixed(2) + " m";
+      lb.textContent = "Localizing · see progress";
       lb.title =
         "Particles are still spread over the map (position ±" +
         (CURLOC.position_stddev_m ?? 0).toFixed(2) +
@@ -787,11 +924,11 @@ function applyMode() {
         (((CURLOC.yaw_stddev_rad ?? 0) * 180) / Math.PI).toFixed(0) +
         "°). Drive the robot to help it converge — the pose shown is not settled yet.";
     } else if (st == "failed") {
-      lb.textContent = "relocalization failed";
+      lb.textContent = "Localization failed";
       lb.title = (CURLOC || {}).detail || "The localizer could not find the robot on this map.";
     } else if (st == "converged") {
-      lb.textContent = "localized ±" + (CURLOC.position_stddev_m ?? 0).toFixed(2) + " m";
-      lb.title = "The particle filter has converged; the pose shown is the filter's estimate.";
+      lb.textContent = "Localized";
+      lb.title = "The pose is confirmed. See laser verification for live localization confidence.";
     }
   }
   let eb = document.getElementById("enginebadge");

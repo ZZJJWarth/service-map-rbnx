@@ -105,6 +105,16 @@ class WebUiApiTest(unittest.TestCase):
         self.assertTrue(out["ok"])
         save.assert_called_once_with("lab", "n")
 
+    def test_pose_candidates_forwards_to_shared_impl(self):
+        expected = {"ok": True, "detail": "ambiguous", "map_id": "lab",
+                    "generation": 3, "needs_selection": True,
+                    "candidates_json": "[]"}
+        with patch.object(webui.map_ops, "get_pose_candidates_impl",
+                          return_value=expected) as query:
+            out = self.call("/api/pose_candidates")
+        self.assertEqual(out, expected)
+        query.assert_called_once_with()
+
     def test_load_forwards_the_pose_seed(self):
         with patch.object(webui.map_ops, "load_map_impl",
                           return_value={"ok": True, "detail": "loaded"}) as load:
@@ -183,6 +193,8 @@ class StaticAssetTest(unittest.TestCase):
         self.assertIn("session id", js)          # the mode-switch explanation
         self.assertIn("MIN_POSE_DRAG_PX", js)    # the pose drag has a floor
         self.assertIn("runExclusive", js)        # map ops are single-flight
+        self.assertIn('candidateTool.hidden = s.engine !== "slam_toolbox"', js)
+        self.assertIn("tool-candidates", html)
         self.assertIn("posehint", html)
         self.assertIn("/static/app.js", html)
         # Styles are served from disk, never fetched: the robot has no internet.
@@ -251,6 +263,8 @@ class ReferenceTrustTest(unittest.TestCase):
         self.sample = [(0, 1, 1)]
         self.patches = [
             patch.object(reference_time, "_clock", SimpleNamespace(read=lambda: self.sample[0])),
+            patch.object(webui.map_ops, "active_algo", return_value="slam_toolbox"),
+            patch.object(webui.map_ops._LOCALIZATION, "snapshot", return_value={"run_id": 0, "map_id": "", "state": "idle"}),
             patch.object(webui, "_reference", None),
             patch.object(webui, "_latest", dict.fromkeys(webui._latest)),
             patch.object(webui, "_trust", dict(grid_for="m", grid=object(), fit=None,
